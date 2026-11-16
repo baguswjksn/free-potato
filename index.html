@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plain EPUB Reader</title>
+<style>
+:root { color-scheme: light; --paper: #f3e9d2; --ink: #2b2118; --size: 19px; }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--paper); color: var(--ink); font: var(--size)/1.55 Georgia, serif; display: flex; flex-direction: column; overflow: hidden; }
+[hidden] { display: none !important; }
+button, label { font: 14px monospace; color: var(--ink); background: var(--paper); border: 2px solid var(--ink); padding: 10px 16px; cursor: pointer; }
+button:focus-visible, label:focus-within { outline: 3px solid var(--ink); outline-offset: 3px; }
+#file { position: absolute; opacity: 0; width: 1px; }
+
+#start, #menu { max-width: 34em; width: 100%; margin: 0 auto; padding: 24px; }
+#start { margin: auto; }
+#start p { font: 14px/1.8 monospace; }
+#menu { overflow-y: auto; }
+#toc button { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--ink); font: 1em Georgia, serif; }
+
+#stage { flex: 1; min-height: 0; padding: 28px 24px 8px; }
+#view { height: 100%; max-width: 34em; margin: 0 auto; overflow: hidden; }
+#text { height: 100%; column-gap: 48px; column-fill: auto; text-align: justify; hyphens: auto; overflow-wrap: break-word; }
+#text p { margin: 0 0 .7em; }
+#text h1, #text h2, #text h3 { font-size: 1.2em; line-height: 1.25; text-align: left; break-after: avoid; }
+#text img, #text svg { max-width: 100%; max-height: var(--h); height: auto; display: block; margin: 0 auto; }
+#text a { color: inherit; }
+#bar { font: 12px monospace; text-align: center; padding: 6px 24px 8px; border-top: 1px solid var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>Plain EPUB Reader</h1>
+  <label for="file">Open EPUB<input type="file" id="file" accept=".epub"></label>
+  <p id="msg">Tap right or press &rarr; for the next page.<br>Tap left or press &larr; to go back.<br>Tap the middle for chapters and text size.</p>
+</div>
+
+<div id="stage" hidden><div id="view"><div id="text"></div></div></div>
+<div id="bar" hidden></div>
+
+<div id="menu" hidden>
+  <button id="back">Back to book</button>
+  <button id="smaller" aria-label="Smaller text">A&minus;</button>
+  <button id="bigger" aria-label="Larger text">A+</button>
+  <label for="file">Open another</label>
+  <div id="toc"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const text = $('text'), GAP = 48;
+let zip, spine, toc, title, cur = 0, page = 0, pages = 1, W = 0;
+// Storage can be blocked in some browsers; fall back to remembering nothing.
+const store = (() => { try { return localStorage; } catch { return { getItem() {}, setItem() {} }; } })();
+let size = +store.getItem('size') || 19;
+
+// Read a file out of the zip. Returns bytes.
+async function unzip(buf, name) {
+  const dv = new DataView(buf), u8 = new Uint8Array(buf);
+  let end = buf.byteLength - 22;
+  while (dv.getUint32(end, true) !== 0x06054b50) end--;
+  let p = dv.getUint32(end + 16, true);
+  for (let n = dv.getUint16(end + 10, true); n > 0; n--) {
+    const nameLen = dv.getUint16(p + 28, true);
+    if (new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nameLen)) === name) {
+      const off = dv.getUint32(p + 42, true);
+      const from = off + 30 + dv.getUint16(off + 26, true) + dv.getUint16(off + 28, true);
+      const data = u8.subarray(from, from + dv.getUint32(p + 20, true));
+      if (dv.getUint16(p + 10, true) === 0) return data;
+      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    p += 46 + nameLen + dv.getUint16(p + 30, true) + dv.getUint16(p + 32, true);
+  }
+  throw new Error('missing ' + name);
+}
+const read = async name => new TextDecoder().decode(await unzip(zip, name));
+const xml = (s, type = 'application/xml') => new DOMParser().parseFromString(s, type);
+const all = (node, tag) => [...node.getElementsByTagNameNS('*', tag)];
+
+// Turn a relative link into a full path inside the zip.
+function resolve(base, href) {
+  const parts = base.split('/').slice(0, -1);
+  for (const s of decodeURIComponent(href.split('#')[0]).split('/')) {
+    if (s === '..') parts.pop(); else if (s !== '.') parts.push(s);
+  }
+  return parts.join('/');
+}
+
+async function openBook(file) {
+  zip = await file.arrayBuffer();
+  const opfPath = all(xml(await read('META-INF/container.xml')), 'rootfile')[0].getAttribute('full-path');
+  const opf = xml(await read(opfPath));
+  const items = {};
+  let tocPath;
+  for (const it of all(opf, 'item')) {
+    items[it.getAttribute('id')] = resolve(opfPath, it.getAttribute('href'));
+    if (/nav/.test(it.getAttribute('properties')) || /ncx/.test(it.getAttribute('media-type'))) tocPath ??= items[it.getAttribute('id')];
+  }
+  spine = all(opf, 'itemref').map(r => items[r.getAttribute('idref')]);
+  title = all(opf, 'title')[0]?.textContent || file.name;
+
+  // Chapters: EPUB 3 lists them as <a href>, EPUB 2 as <navPoint> with <content src>.
+  toc = [];
+  if (tocPath) {
+    const doc = xml(await read(tocPath));
+    for (const el of [...all(doc, 'a'), ...all(doc, 'navPoint')]) {
+      const href = el.getAttribute('href') || all(el, 'content')[0]?.getAttribute('src');
+      const i = href ? spine.indexOf(resolve(tocPath, href)) : -1;
+      const label = (all(el, 'text')[0] || el).textContent.trim();
+      if (i >= 0 && !toc.some(t => t.i === i)) toc.push({ label, i });
+    }
+  }
+
+  $('start').hidden = $('menu').hidden = true;
+  $('stage').hidden = $('bar').hidden = false;
+  const saved = JSON.parse(store.getItem('pos:' + title) || '[0,0]');
+  await show(saved[0], saved[1]);
+}
+
+// Load chapter i and jump to a position in it (0 = start, 1 = end).
+async function show(i, where) {
+  const path = spine[i];
+  let doc = xml(await read(path), 'application/xhtml+xml');
+  if (doc.querySelector('parsererror')) doc = xml(await read(path), 'text/html');
+  const body = doc.querySelector('body');
+  body.querySelectorAll('script, style, link, iframe').forEach(el => el.remove());
+  for (const el of body.querySelectorAll('*')) {
+    for (const a of [...el.attributes]) if (/^on|^style$/.test(a.name)) el.removeAttribute(a.name);
+  }
+  for (const img of body.querySelectorAll('img, image')) {
+    const attr = img.hasAttribute('src') ? 'src' : img.hasAttribute('href') ? 'href' : 'xlink:href';
+    const src = resolve(path, img.getAttribute(attr) || '');
+    const type = src.endsWith('.svg') ? 'image/svg+xml' : '';
+    const blob = await unzip(zip, src).then(b => new Blob([b], { type }), () => new Blob());
+    img.setAttribute(attr, URL.createObjectURL(blob));
+  }
+  cur = i;
+  text.replaceChildren(...[...body.childNodes].map(n => document.importNode(n, true)));
+  text.querySelectorAll('img').forEach(img => img.onload = () => layout());
+  layout(where);
+}
+
+// Split the chapter into screen-wide columns and show one of them.
+function layout(where = pages > 1 ? page / (pages - 1) : 0) {
+  if ($('stage').hidden) return;
+  const view = $('view');
+  W = view.clientWidth;
+  text.style.width = text.style.columnWidth = W + 'px';
+  text.style.setProperty('--h', view.clientHeight + 'px');
+  pages = Math.max(1, Math.round((text.scrollWidth + GAP) / (W + GAP)));
+  turn(Math.round(where * (pages - 1)) - page);
+}
+
+function turn(by) {
+  page += by;
+  if (page >= pages && cur < spine.length - 1) return show(cur + 1, 0);
+  if (page < 0 && cur > 0) return show(cur - 1, 1);
+  page = Math.min(Math.max(page, 0), pages - 1);
+  text.style.transform = `translateX(${-page * (W + GAP)}px)`;
+  const chapter = toc.findLast(t => t.i <= cur)?.label || title;
+  const percent = Math.floor((cur + (page + 1) / pages) / spine.length * 100);
+  $('bar').textContent = `${chapter}  ·  ${page + 1}/${pages}  ·  ${percent}%`;
+  store.setItem('pos:' + title, JSON.stringify([cur, pages > 1 ? page / (pages - 1) : 0]));
+}
+
+function menu(open) {
+  $('menu').hidden = !open;
+  $('stage').hidden = $('bar').hidden = open;
+  if (!open) return layout();
+  $('toc').replaceChildren(...toc.map(t => {
+    const b = document.createElement('button');
+    b.textContent = (t.i === toc.findLast(x => x.i <= cur)?.i ? '▸ ' : '') + t.label;
+    b.onclick = () => { menu(false); show(t.i, 0); };
+    return b;
+  }));
+}
+
+function resize(by) {
+  size = Math.min(32, Math.max(13, size + by));
+  document.documentElement.style.setProperty('--size', size + 'px');
+  store.setItem('size', size);
+}
+resize(0);
+
+$('stage').onclick = e => {
+  const x = e.clientX / innerWidth;
+  if (x < 0.33) turn(-1); else if (x > 0.67) turn(1); else menu(true);
+};
+$('back').onclick = () => menu(false);
+$('smaller').onclick = () => resize(-1);
+$('bigger').onclick = () => resize(1);
+onkeydown = e => {
+  if ($('stage').hidden) return;
+  if (e.key === 'ArrowRight' || e.key === ' ') turn(1);
+  if (e.key === 'ArrowLeft') turn(-1);
+};
+onresize = () => layout();
+$('file').onchange = e => openBook(e.target.files[0]).catch(() => {
+  $('menu').hidden = $('stage').hidden = $('bar').hidden = true;
+  $('start').hidden = false;
+  $('msg').textContent = 'Could not open that file. Choose an .epub without DRM.';
+});
+</script>
+</body>
+</html>
